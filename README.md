@@ -88,6 +88,23 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 `seq` 由 `rooms.last_seq` 在写事务内递增分配（单写者 + 事务 = 无空洞、无并发交错），
 房间内消息严格全序。客户端凭 seq 即可检测空洞并触发补发，无需依赖时钟。
 
+### 6. 并发：忙锁重试与不阻塞事件循环
+
+SQLite 的 WAL 模式下读写互不阻塞，但多个写操作（发消息、保存游标、建房、禁言）
+在同一时刻仍会竞争唯一写锁，命中 `SQLITE_BUSY`。为避免这类瞬时锁竞争直接表现为
+WebSocket `INTERNAL` 错误：
+
+- **缩小事务范围**：写事务只包含必须原子化的 DB 语句；ACK、广播等发帧一律在事务
+  提交之后进行，尽量缩短写锁持有时间。
+- **有限次退避重试**：`BEGIN` / 事务体 / `COMMIT` 任一处遇到忙锁，事务整体回滚后
+  以指数退避重试（默认 5 次，10ms→200ms 封顶）。回滚会撤销未提交的 `last_seq`
+  递增，因此重试不会造成 seq 空洞。游标 UPSERT 本就只向前推进，重试安全幂等。
+- **退避不阻塞事件循环**：重试等待用异步 `setTimeout`，期间可继续处理其它连接；
+  同时把 `busy_timeout` 从 5s 降到 1.5s（`DB_BUSY_TIMEOUT_MS`），避免驱动为等锁
+  而长时间同步阻塞事件循环，到点即抛 busy 交由应用层重试。
+- 读路径（历史、补发、校验）也做同样的忙锁兜底；非忙锁错误（如磁盘 I/O）不重试，
+  立即上抛。
+
 ## 协议（JSON 文本帧）
 
 ### 客户端 → 服务端
@@ -138,6 +155,9 @@ GET  /ws?token=<token>            →  WebSocket 升级
 |---|---|---|
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | 监听地址 |
 | `CHAT_DB_PATH` | `chat.db` | SQLite 路径（`:memory:` 用于测试） |
+| `DB_BUSY_TIMEOUT_MS` | `1500` | 单次同步忙等上限，到点即抛 busy 交应用层重试（避免长阻塞事件循环） |
+| `DB_BUSY_MAX_RETRIES` | `5` | 关键写/读操作忙锁最大重试次数 |
+| `DB_BUSY_BACKOFF_BASE_MS` / `DB_BUSY_BACKOFF_MAX_MS` | `10` / `200` | 忙锁退避基数（指数翻倍）/ 单次上限 |
 | `MAX_CONNECTIONS` | `1000` | 全局并发连接上限 |
 | `MAX_CONNECTIONS_PER_USER` | `3` | 单用户连接上限（多端） |
 | `HEARTBEAT_INTERVAL_MS` / `HEARTBEAT_TIMEOUT_MS` | `30000` / `75000` | 心跳周期 / 判死超时 |

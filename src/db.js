@@ -3,6 +3,8 @@
 const { DatabaseSync } = require('node:sqlite');
 const { now } = require('./util');
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * 持久层：SQLite（WAL 模式）。
  *
@@ -12,12 +14,28 @@ const { now } = require('./util');
  *    提交同一条消息时不会产生重复记录，实现发送幂等。
  * 3. seq 为每房间单调递增序号，由 rooms.last_seq 计数器在事务内分配——保证房间内
  *    消息全序（时序可控），客户端可凭 seq 检测空洞并触发补发。
+ *
+ * 并发与忙锁：
+ * - 关键写路径（写消息、保存游标、建房、禁言等）在 SQLITE_BUSY/LOCKED 时做有限次
+ *   指数退避重试；退避用 setTimeout（异步），不占用事件循环。
+ * - busy_timeout 设较短，到点未拿到锁立即抛出交由应用层重试，避免同步阻塞事件循环。
+ * - 事务体尽量收窄：只包含必须的读写，广播/发帧一律在事务提交之后进行。
  */
+
+/** 判断是否为 SQLite 忙/锁错误（SQLITE_BUSY / SQLITE_LOCKED） */
+function isBusyError(err) {
+  if (!err) return false;
+  if (err.code === 'SQLITE_BUSY' || err.code === 'SQLITE_LOCKED') return true;
+  // node:sqlite 将扩展码归并为 ERR_SQLITE_ERROR，需结合消息文案判断
+  if (err.code === 'ERR_SQLITE_ERROR') {
+    return /database is locked|database table is locked/i.test(err.message || '');
+  }
+  return false;
+}
 
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = FULL;
 
 CREATE TABLE IF NOT EXISTS users (
@@ -72,10 +90,36 @@ const MSG_SELECT = `
 `;
 
 class ChatDB {
-  constructor(dbPath) {
+  constructor(dbPath, options = {}) {
     this.db = new DatabaseSync(dbPath);
+    this.busyTimeoutMs = options.busyTimeoutMs ?? 1_500;
+    this.maxRetries = options.maxRetries ?? 5;
+    this.backoffBaseMs = options.backoffBaseMs ?? 10;
+    this.backoffMaxMs = options.backoffMaxMs ?? 200;
+    this.db.exec(`PRAGMA busy_timeout = ${this.busyTimeoutMs};`);
     this.db.exec(SCHEMA);
     this._prepare();
+  }
+
+  /**
+   * 关键写操作的有限次忙锁重试：仅对 SQLITE_BUSY/LOCKED 退避后重试，其它错误立即抛出。
+   * 退避走 setTimeout（非阻塞），等待期间事件循环可处理其它连接。
+   */
+  async _withRetry(label, fn) {
+    let attempt = 0;
+    for (;;) {
+      try {
+        return fn();
+      } catch (err) {
+        if (!isBusyError(err) || attempt >= this.maxRetries) throw err;
+        const delay = this._backoffDelay(attempt);
+        console.warn(
+          `[db] ${label} 忙锁，第 ${attempt + 1}/${this.maxRetries} 次重试，等待 ${delay}ms`
+        );
+        await sleep(delay);
+        attempt++;
+      }
+    }
   }
 
   _prepare() {
@@ -131,32 +175,61 @@ class ChatDB {
     };
   }
 
-  /** 在 IMMEDIATE 事务中执行 fn，失败回滚。node:sqlite 为同步驱动，单进程内无并发交错。 */
-  _tx(fn) {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const r = fn();
-      this.db.exec('COMMIT');
-      return r;
-    } catch (err) {
-      try { this.db.exec('ROLLBACK'); } catch { /* 已回滚 */ }
-      throw err;
+  /** 指数退避延迟（毫秒） */
+  _backoffDelay(attempt) {
+    return Math.min(this.backoffBaseMs * 2 ** attempt, this.backoffMaxMs);
+  }
+
+  /**
+   * 在 IMMEDIATE 事务中执行 fn，失败回滚。
+   * BEGIN / 事务体 / COMMIT 任一处遇到忙锁都会整体回滚后重试（共用 maxRetries 预算）：
+   * 回滚后 bumpSeq 等操作一并撤销，重试不会造成 seq 跳号/空洞。
+   * 注意：fn 内只能包含 DB 语句（重试会整体重新执行），不得夹带广播等外部副作用。
+   */
+  async _tx(fn) {
+    let attempt = 0;
+    for (;;) {
+      let began = false;
+      try {
+        this.db.exec('BEGIN IMMEDIATE');
+        began = true;
+        const r = fn();
+        this.db.exec('COMMIT');
+        return r;
+      } catch (err) {
+        if (began) {
+          try { this.db.exec('ROLLBACK'); } catch { /* 已自动回滚或连接异常 */ }
+        }
+        if (!isBusyError(err) || attempt >= this.maxRetries) throw err;
+        const delay = this._backoffDelay(attempt);
+        console.warn(
+          `[db] 事务忙锁，第 ${attempt + 1}/${this.maxRetries} 次重试，等待 ${delay}ms`
+        );
+        await sleep(delay);
+        attempt++;
+      }
     }
   }
 
   // ---------- 用户 ----------
 
-  createUser(id, name, tokenRandom) {
-    this.stmt.insertUser.run(id, name, tokenRandom, now());
-    return this.stmt.userById.get(id);
+  async createUser(id, name, tokenRandom) {
+    return this._tx(() => {
+      this.stmt.insertUser.run(id, name, tokenRandom, now());
+      return this.stmt.userById.get(id);
+    });
   }
 
-  getUserByName(name) { return this.stmt.userByName.get(name); }
-  getUserById(id) { return this.stmt.userById.get(id); }
+  async getUserByName(name) {
+    return this._withRetry('getUserByName', () => this.stmt.userByName.get(name));
+  }
+  async getUserById(id) {
+    return this._withRetry('getUserById', () => this.stmt.userById.get(id));
+  }
 
   // ---------- 房间与成员 ----------
 
-  createRoom(id, name, creatorId) {
+  async createRoom(id, name, creatorId) {
     return this._tx(() => {
       this.stmt.insertRoom.run(id, name, creatorId, now());
       // 创建者即管理员
@@ -165,22 +238,36 @@ class ChatDB {
     });
   }
 
-  getRoom(id) { return this.stmt.roomById.get(id); }
-  getRoomByName(name) { return this.stmt.roomByName.get(name); }
-  listRoomsForUser(userId) { return this.stmt.roomsForUser.all(userId); }
-  listMembers(roomId) { return this.stmt.membersOfRoom.all(roomId); }
-
-  joinRoom(roomId, userId) {
-    this.stmt.upsertMember.run(roomId, userId, 'member', now());
-    return this.stmt.member.get(roomId, userId);
+  async getRoom(id) {
+    return this._withRetry('getRoom', () => this.stmt.roomById.get(id));
+  }
+  async getRoomByName(name) {
+    return this._withRetry('getRoomByName', () => this.stmt.roomByName.get(name));
+  }
+  async listRoomsForUser(userId) {
+    return this._withRetry('listRoomsForUser', () => this.stmt.roomsForUser.all(userId));
+  }
+  async listMembers(roomId) {
+    return this._withRetry('listMembers', () => this.stmt.membersOfRoom.all(roomId));
   }
 
-  getMember(roomId, userId) { return this.stmt.member.get(roomId, userId); }
+  async joinRoom(roomId, userId) {
+    return this._tx(() => {
+      this.stmt.upsertMember.run(roomId, userId, 'member', now());
+      return this.stmt.member.get(roomId, userId);
+    });
+  }
+
+  async getMember(roomId, userId) {
+    return this._withRetry('getMember', () => this.stmt.member.get(roomId, userId));
+  }
 
   /** 设置禁言截止时间（0 表示解除禁言） */
-  setMuted(roomId, userId, mutedUntil) {
-    this.stmt.setMuted.run(mutedUntil, roomId, userId);
-    return this.stmt.member.get(roomId, userId);
+  async setMuted(roomId, userId, mutedUntil) {
+    return this._tx(() => {
+      this.stmt.setMuted.run(mutedUntil, roomId, userId);
+      return this.stmt.member.get(roomId, userId);
+    });
   }
 
   // ---------- 消息 ----------
@@ -191,7 +278,7 @@ class ChatDB {
    *  - duplicate=false：新消息，已分配 seq 并落库（调用方负责广播）；
    *  - duplicate=true ：同 clientMsgId 的消息已存在，直接返回原消息（调用方只回 ACK，不再广播）。
    */
-  insertMessage({ roomId, clientMsgId, senderId, content }) {
+  async insertMessage({ roomId, clientMsgId, senderId, content }) {
     return this._tx(() => {
       const existing = this.stmt.msgByClientId.get(roomId, senderId, clientMsgId);
       if (existing) return { message: existing, duplicate: true };
@@ -205,23 +292,33 @@ class ChatDB {
   }
 
   /** 断线补发：取 seq > afterSeq 的消息（升序，最多 limit 条） */
-  getMessagesAfter(roomId, afterSeq, limit) {
-    return this.stmt.msgsAfter.all(roomId, afterSeq, limit);
+  async getMessagesAfter(roomId, afterSeq, limit) {
+    return this._withRetry('getMessagesAfter', () =>
+      this.stmt.msgsAfter.all(roomId, afterSeq, limit)
+    );
   }
 
   /** 历史翻页：取 seq < beforeSeq 的消息，返回时按升序排列 */
-  getMessagesBefore(roomId, beforeSeq, limit) {
-    return this.stmt.msgsBefore.all(roomId, beforeSeq, limit).reverse();
+  async getMessagesBefore(roomId, beforeSeq, limit) {
+    const rows = await this._withRetry('getMessagesBefore', () =>
+      this.stmt.msgsBefore.all(roomId, beforeSeq, limit)
+    );
+    return rows.reverse();
   }
 
   // ---------- 游标 ----------
 
-  saveCursor(roomId, userId, lastAckSeq) {
-    this.stmt.upsertCursor.run(roomId, userId, lastAckSeq, now());
+  async saveCursor(roomId, userId, lastAckSeq) {
+    // UPSERT 幂等（仅向前推进），忙锁时可安全重试
+    await this._withRetry('saveCursor', () =>
+      this.stmt.upsertCursor.run(roomId, userId, lastAckSeq, now())
+    );
   }
 
-  getCursor(roomId, userId) {
-    const row = this.stmt.cursor.get(roomId, userId);
+  async getCursor(roomId, userId) {
+    const row = await this._withRetry('getCursor', () =>
+      this.stmt.cursor.get(roomId, userId)
+    );
     return row ? row.lastAckSeq : 0;
   }
 

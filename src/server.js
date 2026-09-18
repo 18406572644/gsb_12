@@ -67,7 +67,12 @@ function msgFrame(m) {
 
 function createChatServer(overrides = {}) {
   const config = { ...defaultConfig, ...overrides };
-  const db = new ChatDB(config.dbPath);
+  const db = new ChatDB(config.dbPath, {
+    busyTimeoutMs: config.dbBusyTimeoutMs,
+    maxRetries: config.dbBusyMaxRetries,
+    backoffBaseMs: config.dbBusyBackoffBaseMs,
+    backoffMaxMs: config.dbBusyBackoffMaxMs,
+  });
   const hub = new Hub(config);
   const limiter = new TokenBucket(config.rateLimitPerSec, config.rateLimitBurst);
   const publicDir = path.join(__dirname, '..', 'public');
@@ -75,8 +80,8 @@ function createChatServer(overrides = {}) {
   // ---------------------------------------------------------------- 消息处理
 
   /** 断线补发：把 roomId 中 seq > fromSeq 的消息按序推给连接，分批，客户端按 sync_done 续拉 */
-  function replayRoom(conn, roomId, fromSeq) {
-    const batch = db.getMessagesAfter(roomId, fromSeq, config.syncBatchSize + 1);
+  async function replayRoom(conn, roomId, fromSeq) {
+    const batch = await db.getMessagesAfter(roomId, fromSeq, config.syncBatchSize + 1);
     const hasMore = batch.length > config.syncBatchSize;
     const slice = hasMore ? batch.slice(0, config.syncBatchSize) : batch;
     for (const m of slice) hub.send(conn, msgFrame(m), { track: true, roomId, seq: m.seq });
@@ -84,14 +89,14 @@ function createChatServer(overrides = {}) {
     hub.send(conn, { type: 'sync_done', roomId, lastSeq, hasMore });
   }
 
-  function requireMember(conn, roomId) {
-    const member = db.getMember(roomId, conn.userId);
+  async function requireMember(conn, roomId) {
+    const member = await db.getMember(roomId, conn.userId);
     if (!member) fail('NOT_MEMBER', 'not a member of this room');
     return member;
   }
 
-  function requireAdmin(conn, roomId) {
-    const member = requireMember(conn, roomId);
+  async function requireAdmin(conn, roomId) {
+    const member = await requireMember(conn, roomId);
     if (member.role !== 'admin') fail('FORBIDDEN', 'admin role required');
     return member;
   }
@@ -101,10 +106,10 @@ function createChatServer(overrides = {}) {
       hub.send(conn, { type: 'pong', t: msg.t });
     },
 
-    create_room(conn, msg) {
+    async create_room(conn, msg) {
       if (!isNonEmptyString(msg.name, 64)) fail('BAD_REQUEST', 'invalid room name');
-      if (db.getRoomByName(msg.name)) fail('ROOM_EXISTS', 'room name already taken');
-      const room = db.createRoom(randomId('r_'), msg.name, conn.userId);
+      if (await db.getRoomByName(msg.name)) fail('ROOM_EXISTS', 'room name already taken');
+      const room = await db.createRoom(randomId('r_'), msg.name, conn.userId);
       hub.joinRoom(conn, room.id);
       hub.send(conn, {
         type: 'joined',
@@ -116,13 +121,13 @@ function createChatServer(overrides = {}) {
       });
     },
 
-    join(conn, msg) {
+    async join(conn, msg) {
       if (!isNonEmptyString(msg.room, 128)) fail('BAD_REQUEST', 'invalid room');
-      const room = db.getRoom(msg.room) || db.getRoomByName(msg.room);
+      const room = (await db.getRoom(msg.room)) || (await db.getRoomByName(msg.room));
       if (!room) fail('NO_SUCH_ROOM', 'room not found');
-      db.joinRoom(room.id, conn.userId);
+      await db.joinRoom(room.id, conn.userId);
       hub.joinRoom(conn, room.id);
-      const member = db.getMember(room.id, conn.userId);
+      const member = await db.getMember(room.id, conn.userId);
       hub.send(conn, {
         type: 'joined',
         roomId: room.id,
@@ -132,8 +137,8 @@ function createChatServer(overrides = {}) {
         lastSeq: room.last_seq,
       });
       // 补发：优先用客户端上报的进度，否则用服务端游标（新设备则从游标开始）
-      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(room.id, conn.userId);
-      if (fromSeq < room.last_seq) replayRoom(conn, room.id, fromSeq);
+      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : await db.getCursor(room.id, conn.userId);
+      if (fromSeq < room.last_seq) await replayRoom(conn, room.id, fromSeq);
     },
 
     leave(conn, msg) {
@@ -141,20 +146,21 @@ function createChatServer(overrides = {}) {
       hub.send(conn, { type: 'left', roomId: msg.roomId });
     },
 
-    msg(conn, msg) {
+    async msg(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
       if (!isNonEmptyString(msg.clientMsgId, 64)) fail('BAD_REQUEST', 'invalid clientMsgId');
       if (!isNonEmptyString(msg.content, config.maxContentLength)) {
         fail('BAD_REQUEST', `content must be 1..${config.maxContentLength} chars`);
       }
-      const member = requireMember(conn, msg.roomId);
+      const member = await requireMember(conn, msg.roomId);
       if (member.muted_until > now()) {
         fail('MUTED', `you are muted until ${new Date(member.muted_until).toISOString()}`);
       }
       if (!limiter.take(conn.userId)) fail('RATE_LIMITED', 'sending too fast, slow down');
 
-      // 先落库（同事务分配 seq），再 ACK，再广播 —— 崩溃也不丢已确认消息
-      const { message, duplicate } = db.insertMessage({
+      // 先落库（同事务分配 seq），再 ACK，再广播 —— 崩溃也不丢已确认消息。
+      // 广播严格放在事务提交之后：缩小事务范围、缩短写锁持有时间。
+      const { message, duplicate } = await db.insertMessage({
         roomId: msg.roomId,
         clientMsgId: msg.clientMsgId,
         senderId: conn.userId,
@@ -174,44 +180,44 @@ function createChatServer(overrides = {}) {
     },
 
     // 客户端累积 ACK：清除未确认队列 + 持久化游标（断线补发的兜底依据）
-    ack(conn, msg) {
+    async ack(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128) || !Number.isInteger(msg.seq)) return;
       if (!conn.rooms.has(msg.roomId)) return; // 只处理本连接已加入的房间
       conn.ack(msg.roomId, msg.seq);
-      db.saveCursor(msg.roomId, conn.userId, msg.seq);
+      await db.saveCursor(msg.roomId, conn.userId, msg.seq);
     },
 
-    sync(conn, msg) {
+    async sync(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
-      requireMember(conn, msg.roomId);
-      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : db.getCursor(msg.roomId, conn.userId);
-      replayRoom(conn, msg.roomId, fromSeq);
+      await requireMember(conn, msg.roomId);
+      const fromSeq = Number.isInteger(msg.lastSeq) ? msg.lastSeq : await db.getCursor(msg.roomId, conn.userId);
+      await replayRoom(conn, msg.roomId, fromSeq);
     },
 
-    history(conn, msg) {
+    async history(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
-      requireMember(conn, msg.roomId);
+      await requireMember(conn, msg.roomId);
       const limit = Math.min(Math.max(1, msg.limit || 50), config.historyMaxLimit);
       const before = Number.isInteger(msg.beforeSeq) ? msg.beforeSeq : Number.MAX_SAFE_INTEGER;
-      const messages = db.getMessagesBefore(msg.roomId, before, limit);
+      const messages = await db.getMessagesBefore(msg.roomId, before, limit);
       hub.send(conn, { type: 'history', roomId: msg.roomId, messages, hasMore: messages.length === limit });
     },
 
-    rooms(conn) {
-      hub.send(conn, { type: 'rooms', rooms: db.listRoomsForUser(conn.userId) });
+    async rooms(conn) {
+      hub.send(conn, { type: 'rooms', rooms: await db.listRoomsForUser(conn.userId) });
     },
 
-    members(conn, msg) {
+    async members(conn, msg) {
       if (!isNonEmptyString(msg.roomId, 128)) fail('BAD_REQUEST', 'invalid roomId');
-      requireMember(conn, msg.roomId);
+      await requireMember(conn, msg.roomId);
       const online = new Set(hub.onlineUserIds(msg.roomId));
-      const members = db.listMembers(msg.roomId).map((m) => ({ ...m, online: online.has(m.userId) }));
+      const members = (await db.listMembers(msg.roomId)).map((m) => ({ ...m, online: online.has(m.userId) }));
       hub.send(conn, { type: 'members', roomId: msg.roomId, members });
     },
 
-    mute(conn, msg) {
-      requireAdmin(conn, msg.roomId);
-      const target = db.getMember(msg.roomId, msg.userId);
+    async mute(conn, msg) {
+      await requireAdmin(conn, msg.roomId);
+      const target = await db.getMember(msg.roomId, msg.userId);
       if (!target) fail('NOT_MEMBER', 'target is not a member');
       if (target.role === 'admin') fail('FORBIDDEN', 'cannot mute an admin');
       const minutes = Number(msg.minutes);
@@ -219,7 +225,7 @@ function createChatServer(overrides = {}) {
         fail('BAD_REQUEST', 'minutes must be 1..1440');
       }
       const until = now() + Math.round(minutes * 60_000);
-      db.setMuted(msg.roomId, msg.userId, until);
+      await db.setMuted(msg.roomId, msg.userId, until);
       hub.broadcast(msg.roomId, {
         type: 'notice',
         roomId: msg.roomId,
@@ -230,11 +236,11 @@ function createChatServer(overrides = {}) {
       });
     },
 
-    unmute(conn, msg) {
-      requireAdmin(conn, msg.roomId);
-      const target = db.getMember(msg.roomId, msg.userId);
+    async unmute(conn, msg) {
+      await requireAdmin(conn, msg.roomId);
+      const target = await db.getMember(msg.roomId, msg.userId);
       if (!target) fail('NOT_MEMBER', 'target is not a member');
-      db.setMuted(msg.roomId, msg.userId, 0);
+      await db.setMuted(msg.roomId, msg.userId, 0);
       hub.broadcast(msg.roomId, {
         type: 'notice',
         roomId: msg.roomId,
@@ -245,7 +251,7 @@ function createChatServer(overrides = {}) {
     },
   };
 
-  function onFrame(conn, raw) {
+  async function onFrame(conn, raw) {
     const msg = parseFrame(raw);
     if (!msg) {
       hub.send(conn, { type: 'error', code: 'BAD_FRAME', message: 'invalid JSON frame' });
@@ -257,7 +263,7 @@ function createChatServer(overrides = {}) {
       return;
     }
     try {
-      handler(conn, msg);
+      await handler(conn, msg);
     } catch (err) {
       if (err instanceof ChatError) {
         hub.send(conn, {
@@ -307,8 +313,8 @@ function createChatServer(overrides = {}) {
       try {
         const body = JSON.parse(await readBody(req));
         if (!isNonEmptyString(body.name, 32)) return json(400, { error: 'invalid name' });
-        let user = db.getUserByName(body.name);
-        if (!user) user = db.createUser(randomId('u_'), body.name, randomSecret());
+        let user = await db.getUserByName(body.name);
+        if (!user) user = await db.createUser(randomId('u_'), body.name, randomSecret());
         const token = signToken(user.id, user.token_random, config.authSecret);
         return json(200, { userId: user.id, name: user.name, token });
       } catch {
@@ -345,34 +351,48 @@ function createChatServer(overrides = {}) {
 
   const wss = new WebSocketServer({ noServer: true });
 
-  httpServer.on('upgrade', (req, socket, head) => {
+  httpServer.on('upgrade', async (req, socket, head) => {
     const reject = (code, text) => {
-      socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\n\r\n`);
-      socket.destroy();
+      try {
+        socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\n\r\n`);
+      } finally {
+        socket.destroy();
+      }
     };
-    const url = new URL(req.url, 'http://localhost');
-    if (url.pathname !== '/ws') return reject(404, 'Not Found');
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      if (url.pathname !== '/ws') return reject(404, 'Not Found');
 
-    const userId = verifyToken(url.searchParams.get('token'), config.authSecret);
-    const user = userId && db.getUserById(userId);
-    if (!user) return reject(401, 'Unauthorized');
+      const userId = verifyToken(url.searchParams.get('token'), config.authSecret);
+      const user = userId && (await db.getUserById(userId));
+      if (!user) return reject(401, 'Unauthorized');
 
-    const denied = hub.checkAdmission(user.id);
-    if (denied) return reject(503, denied);
+      const denied = hub.checkAdmission(user.id);
+      if (denied) return reject(503, denied);
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      const conn = new Connection(ws, user);
-      hub.add(conn);
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        const conn = new Connection(ws, user);
+        hub.add(conn);
 
-      ws.on('pong', () => {
-        conn.lastPong = now();
+        ws.on('pong', () => {
+          conn.lastPong = now();
+        });
+        ws.on('message', (raw) => {
+          // onFrame 内部已兜底错误转 error 帧；这里再兜一层，避免异常变成 unhandled rejection
+          onFrame(conn, raw).catch((err) => {
+            console.error('[onFrame]', err);
+            try { hub.send(conn, { type: 'error', code: 'INTERNAL', message: 'internal error' }); } catch { /* 连接已关闭 */ }
+          });
+        });
+        ws.on('close', () => hub.remove(conn));
+        ws.on('error', () => {}); // 错误后必随 close，统一在 close 清理
+
+        hub.send(conn, { type: 'welcome', userId: user.id, name: user.name, serverTime: now() });
       });
-      ws.on('message', (raw) => onFrame(conn, raw));
-      ws.on('close', () => hub.remove(conn));
-      ws.on('error', () => {}); // 错误后必随 close，统一在 close 清理
-
-      hub.send(conn, { type: 'welcome', userId: user.id, name: user.name, serverTime: now() });
-    });
+    } catch (err) {
+      console.error('[upgrade]', err);
+      reject(500, 'Internal Server Error');
+    }
   });
 
   // ---------------------------------------------------------------- 定时任务
