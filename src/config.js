@@ -11,6 +11,11 @@ module.exports = {
   // SQLite 文件路径，':memory:' 仅用于测试
   dbPath: process.env.CHAT_DB_PATH || 'chat.db',
 
+  // SQLite 忙锁（SQLITE_BUSY）应对
+  busyTimeoutMs: Number(process.env.BUSY_TIMEOUT_MS || 5000), // 驱动内遇锁同步等待上限
+  dbWriteRetries: Number(process.env.DB_WRITE_RETRIES || 5), // 关键写操作忙锁时的额外重试次数
+  dbWriteRetryBaseMs: Number(process.env.DB_WRITE_RETRY_BASE_MS || 5), // 指数退避基数(ms)
+
   // 连接管理
   maxConnections: Number(process.env.MAX_CONNECTIONS || 1000), // 全局最大并发连接
   maxConnectionsPerUser: Number(process.env.MAX_CONNECTIONS_PER_USER || 3), // 单用户最大连接（多端）

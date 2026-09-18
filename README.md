@@ -16,7 +16,7 @@
 ```bash
 npm install
 npm start          # http://localhost:8080
-npm test           # 13 个集成测试
+npm test           # 17 个集成测试
 ```
 
 浏览器打开 `http://localhost:8080`，用不同昵称开两个标签页即可体验（建房、发消息、
@@ -88,6 +88,21 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 `seq` 由 `rooms.last_seq` 在写事务内递增分配（单写者 + 事务 = 无空洞、无并发交错），
 房间内消息严格全序。客户端凭 seq 即可检测空洞并触发补发，无需依赖时钟。
 
+### 6. 并发与忙锁（SQLITE_BUSY）
+
+消息写入、游标保存、历史查询会并发到达。为避免 SQLite 忙锁导致 WS 处理直接报内部错误：
+
+- **写串行队列**：所有写操作（消息、游标、房间/成员、禁言）经进程内单条 FIFO 队列
+  串行化，排队不占数据库锁，从根上消除同进程写-写忙锁；处理逻辑在入队前同步执行，
+  故排队顺序即消息到达顺序，房间 seq 全序不变。
+- **读不阻塞**：WAL 下读操作直接执行、不进队列；写事务退避等待期间，其他连接的
+  历史查询/补发仍可穿插，事件循环不被同步阻塞。
+- **有限退避重试**：关键写遇忙锁时按指数退避重试（`busy_timeout` 同步等待之外再异步
+  兜底，`DB_WRITE_RETRIES` / `DB_WRITE_RETRY_BASE_MS` 可调），重试期间让出事件循环；
+  耗尽后回可重试的 `SERVICE_BUSY`，而非笼统 `INTERNAL`。
+- **缩小事务范围**：消息事务内只做「查重 + 分配 seq + 插入」，组装下发帧所需的 JOIN
+  查询移到提交后执行，缩短持锁时间。
+
 ## 协议（JSON 文本帧）
 
 ### 客户端 → 服务端
@@ -122,7 +137,8 @@ server → {type:'sync_done', roomId, lastSeq: 57, hasMore: false}
 | `server_shutdown` | 服务即将关闭，请准备重连 |
 
 错误码：`BAD_FRAME` `BAD_REQUEST` `UNKNOWN_TYPE` `NOT_MEMBER` `NO_SUCH_ROOM`
-`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `INTERNAL`；
+`ROOM_EXISTS` `FORBIDDEN` `MUTED` `RATE_LIMITED` `SERVICE_BUSY` `INTERNAL`；
+其中 `SERVICE_BUSY` 表示数据库忙锁重试耗尽的临时性失败，客户端可用原 `clientMsgId` 重试。
 升级阶段拒绝：`401`（认证失败）、`503 SERVER_FULL` / `503 TOO_MANY_DEVICES`。
 
 ### 连接建立
