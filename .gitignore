@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# EasyOCR models (large binary files)
+backend/models/*.pth
+node_modules/
+# Temp & logs
+backend/temp/
+backend/logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Chat runtime data
+chat.db
+chat.db-*
+
+# Runtime data
+storage/
+data/
+.smoke/
